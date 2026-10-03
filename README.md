@@ -63,6 +63,19 @@ bottom-right corner shows `site · STATE` so you can confirm it's tracking.
 | `Cmd`+`Esc`  | quit                |
 | `Cmd`+`Q`    | quit                |
 
+## Dashboard
+
+The server also hosts a tiny local dashboard at
+**http://localhost:8766** (still stdlib only — no dependencies):
+
+- **Live state** — the current aggregate glow plus per-site cards
+  (chatgpt / claude / gemini) with last-seen times, refreshed every second.
+- **Preview glow** — force each state for 4 seconds to test the cracked-lid
+  look without opening a chat.
+- **Pause** — freezes the glow nearly off without killing the server.
+- **Colors** — retune any state's color live; saved to `server/config.json`
+  so they survive restarts.
+
 ## Design notes
 
 - **Background relay, not direct socket.** The prompt sketched content scripts

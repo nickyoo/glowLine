@@ -21,6 +21,10 @@ Shortcuts (window focused):
     Cmd+Esc      quit
     Cmd+Q        quit
 
+A tiny local dashboard lives at http://localhost:8766 — live state per site,
+preview buttons to test each glow, pause, and color tuning (saved to
+config.json).
+
 Run:  python3 server/glowline.py
 Note: needs tkinter. python.org macOS builds ship it; Homebrew python needs
 `brew install python-tk@<version>`.
@@ -30,13 +34,16 @@ import base64
 import hashlib
 import json
 import math
+import os
 import socket
 import struct
 import threading
 import time
 import tkinter as tk
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8765
+DASHBOARD_PORT = 8766
 STALE_AFTER = 45  # seconds without a message before a site is forgotten
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -119,18 +126,86 @@ def _send_frame(conn, opcode, payload=b""):
 
 
 class GlowState:
-    """Thread-safe per-site state with priority aggregation + staleness."""
+    """Thread-safe per-site state with priority aggregation + staleness.
+
+    Also holds the dashboard-controllable bits: color config (persisted to
+    config.json), a temporary preview override, and pause.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._sites = {}  # site -> (state, last_seen_monotonic)
+        self._colors = {k: tuple(v) for k, v in COLORS.items()}
+        self._override = None  # (state, until_monotonic)
+        self._paused = False
+        self._config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "config.json")
+        self._load_config()
 
+    # -- color config --------------------------------------------------
+    @staticmethod
+    def _parse_hex(hx):
+        hx = hx.lstrip("#")
+        if len(hx) != 6:
+            raise ValueError("bad hex")
+        return tuple(int(hx[i:i + 2], 16) for i in (0, 2, 4))
+
+    @staticmethod
+    def _to_hex(rgb):
+        return "#%02x%02x%02x" % tuple(max(0, min(255, int(c))) for c in rgb)
+
+    def _load_config(self):
+        try:
+            with open(self._config_path) as fh:
+                saved = json.load(fh).get("colors", {})
+            for state, hx in saved.items():
+                if state in self._colors and isinstance(hx, str):
+                    self._colors[state] = self._parse_hex(hx)
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def _save_config(self):
+        try:
+            with open(self._config_path, "w") as fh:
+                json.dump({"colors": {s: self._to_hex(c)
+                                      for s, c in self._colors.items()}},
+                          fh, indent=2)
+        except OSError:
+            pass
+
+    def set_colors(self, colors):
+        with self._lock:
+            for state, hx in (colors or {}).items():
+                if state in self._colors and isinstance(hx, str):
+                    try:
+                        self._colors[state] = self._parse_hex(hx)
+                    except ValueError:
+                        pass
+            self._save_config()
+
+    # -- state updates ---------------------------------------------------
     def update(self, site, state):
         if state not in PRIORITY:
             return
         with self._lock:
             self._sites[site] = (state, time.monotonic())
 
+    def preview(self, state, seconds=3):
+        """Temporarily force the glow to a state (dashboard preview)."""
+        if state not in PRIORITY:
+            return
+        try:
+            seconds = max(1, min(int(seconds), 30))
+        except (TypeError, ValueError):
+            seconds = 3
+        with self._lock:
+            self._override = (state, time.monotonic() + seconds)
+
+    def set_paused(self, paused):
+        with self._lock:
+            self._paused = bool(paused)
+
+    # -- reads -------------------------------------------------------------
     def snapshot(self):
         """Returns (aggregate_state, hottest_site)."""
         now = time.monotonic()
@@ -144,6 +219,36 @@ class GlowState:
                 if PRIORITY[state] > PRIORITY[best]:
                     best, best_site = state, site
         return best, best_site
+
+    def display(self):
+        """(state, site, paused, overriding, colors) after override rules."""
+        state, site = self.snapshot()
+        now = time.monotonic()
+        with self._lock:
+            colors = dict(self._colors)
+            paused = self._paused
+            overriding = False
+            if self._override and now < self._override[1]:
+                state, overriding = self._override[0], True
+            else:
+                self._override = None
+        return state, site, paused, overriding, colors
+
+    def status(self):
+        """JSON-friendly snapshot for the dashboard."""
+        state, site, paused, overriding, colors = self.display()
+        now = time.monotonic()
+        with self._lock:
+            sites = {s: {"state": st, "age_s": round(now - seen, 1)}
+                     for s, (st, seen) in self._sites.items()}
+        return {
+            "aggregate": state,
+            "site": site,
+            "paused": paused,
+            "overriding": overriding,
+            "colors": {s: self._to_hex(c) for s, c in colors.items()},
+            "sites": sites,
+        }
 
 
 def _client_loop(conn, addr, glow):
@@ -188,6 +293,73 @@ def serve_forever(glow):
         threading.Thread(
             target=_client_loop, args=(conn, addr, glow), daemon=True
         ).start()
+
+
+# ---------------------------------------------------------------- dashboard
+class DashboardHandler(BaseHTTPRequestHandler):
+    glow = None             # set by serve_dashboard
+    dashboard_path = ""     # set by serve_dashboard
+
+    def log_message(self, *args):
+        pass  # keep the console for glow state, not HTTP noise
+
+    def _send_json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            try:
+                with open(self.dashboard_path, "rb") as fh:
+                    body = fh.read()
+            except OSError:
+                self.send_error(404, "dashboard.html not found")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/state":
+            self._send_json(self.glow.status())
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        if self.path == "/api/preview":
+            self.glow.preview(body.get("state"), body.get("seconds", 3))
+            self._send_json({"ok": True})
+        elif self.path == "/api/pause":
+            self.glow.set_paused(body.get("paused", False))
+            self._send_json({"ok": True})
+        elif self.path == "/api/config":
+            self.glow.set_colors(body.get("colors"))
+            self._send_json({"ok": True})
+        else:
+            self.send_error(404)
+
+
+def serve_dashboard(glow):
+    DashboardHandler.glow = glow
+    DashboardHandler.dashboard_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+    srv = ThreadingHTTPServer(("127.0.0.1", DASHBOARD_PORT), DashboardHandler)
+    print(f"glowline dashboard at http://localhost:{DASHBOARD_PORT}")
+    srv.serve_forever()
 
 
 # ------------------------------------------------------------------- display
@@ -242,24 +414,31 @@ class GlowWindow:
         self.root.destroy()
 
     def tick(self):
-        state, site = self.glow.snapshot()
-        target = COLORS[state]
+        state, site, paused, overriding, colors = self.glow.display()
+        target = colors[state]
 
-        # pulse the "active" states; solid for the rest
-        t = time.monotonic()
-        if state == "BUSY":
-            pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(t * 2 * math.pi / 1.4))
-            target = tuple(c * pulse for c in target)
-        elif state == "ERROR":
-            pulse = 0.50 + 0.50 * (0.5 + 0.5 * math.sin(t * 2 * math.pi / 2.0))
-            target = tuple(c * pulse for c in target)
+        if paused:
+            target = (5, 7, 11)  # nearly off
+        else:
+            # pulse the "active" states; solid for the rest
+            t = time.monotonic()
+            if state == "BUSY":
+                pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(t * 2 * math.pi / 1.4))
+                target = tuple(c * pulse for c in target)
+            elif state == "ERROR":
+                pulse = 0.50 + 0.50 * (0.5 + 0.5 * math.sin(t * 2 * math.pi / 2.0))
+                target = tuple(c * pulse for c in target)
 
         # smooth crossfade toward the target
         self.cur = [c + (tg - c) * 0.18 for c, tg in zip(self.cur, target)]
         self.canvas.itemconfig(self.rect, fill=_hex(self.cur))
-        self.canvas.itemconfig(
-            self.label, text=f"{site or '—'} · {state}" if site else state
-        )
+        if paused:
+            label = "PAUSED"
+        elif overriding:
+            label = f"preview · {state}"
+        else:
+            label = f"{site or '—'} · {state}" if site else state
+        self.canvas.itemconfig(self.label, text=label)
         self.root.after(33, self.tick)  # ~30fps
 
     def run(self):
@@ -269,6 +448,7 @@ class GlowWindow:
 def main():
     glow = GlowState()
     threading.Thread(target=serve_forever, args=(glow,), daemon=True).start()
+    threading.Thread(target=serve_dashboard, args=(glow,), daemon=True).start()
     print("glowline glow window starting — Esc hides, Cmd+Esc quits")
     GlowWindow(glow).run()
 
