@@ -1,0 +1,28 @@
+{
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "js": [
+        "content.js"
+      ],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "description": "Mirrors AI chat state (busy / waiting / error) to a local ambient glow server.",
+  "host_permissions": [
+    "ws://localhost:8765/*"
+  ],
+  "manifest_version": 3,
+  "name": "Glowline",
+  "permissions": [
+    "alarms"
+  ],
+  "version": "1.0.0"
+}
